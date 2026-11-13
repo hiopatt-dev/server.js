@@ -1,102 +1,126 @@
 const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
-require('dotenv').config();
+const axios = require('axios');
 
 const app = express();
 app.use(express.json());
 app.use(cors());
 
-const MONGO_URI = process.env.MONGO_URI || 'твой_ключ_к_бд';
+const MONGO_URI = process.env.MONGO_URI;
+const BOT_TOKEN = process.env.BOT_TOKEN;
+const ADMIN_ID = process.env.ADMIN_ID;
 
 mongoose.connect(MONGO_URI)
-  .then(() => console.log('✅ База данных MongoDB успешно подключена!'))
-  .catch(err => console.error('❌ Ошибка подключения к БД:', err));
+    .then(() => console.log('MongoDB connected'))
+    .catch(err => console.error('MongoDB error:', err));
 
-const userSchema = new mongoose.Schema({
-  telegramId: { type: String, required: true, unique: true },
-  balance: { type: Number, default: 1000 },
-  stats: {
-    totalGames: { type: Number, default: 0 },
-    wins: { type: Number, default: 0 },
-    totalWon: { type: Number, default: 0 },
-    totalLost: { type: Number, default: 0 }
-  },
-  history: { type: Array, default: [] }
+const UserSchema = new mongoose.Schema({
+    telegramId: { type: String, required: true, unique: true },
+    balance: { type: Number, default: 1000 }
+});
+const User = mongoose.model('User', UserSchema);
+
+const WithdrawalSchema = new mongoose.Schema({
+    telegramId: String,
+    amount: Number,
+    status: { type: String, default: 'pending' },
+    createdAt: { type: Date, default: Date.now }
+});
+const Withdrawal = mongoose.model('Withdrawal', WithdrawalSchema);
+
+app.get('/', (req, res) => {
+    res.send('NexusUp Backend is running successfully!');
 });
 
-const User = mongoose.model('User', userSchema);
-
-app.get('/api/user/:telegramId', async (req, res) => {
-  try {
-    let user = await User.findOne({ telegramId: req.params.telegramId });
-    if (!user) {
-      user = new User({ telegramId: req.params.telegramId, balance: 1000 });
-      await user.save();
+app.get('/api/balance/:telegramId', async (req, res) => {
+    try {
+        const { telegramId } = req.params;
+        let user = await User.findOne({ telegramId });
+        if (!user) {
+            user = await User.create({ telegramId, balance: 1000 });
+        }
+        res.json({ success: true, balance: user.balance });
+    } catch (err) {
+        res.status(500).json({ success: false, error: err.message });
     }
-    res.json(user);
-  } catch (e) {
-    res.status(500).json({ error: 'Ошибка сервера' });
-  }
 });
 
-app.post('/api/play', async (req, res) => {
-  const { telegramId, bet, multiplier } = req.body;
+app.post('/api/upgrade', async (req, res) => {
+    try {
+        const { telegramId, amount, multiplier, winChance } = req.body;
 
-  if (!telegramId || bet <= 0 || !multiplier) {
-    return res.status(400).json({ error: 'Неверные данные запроса' });
-  }
+        let user = await User.findOne({ telegramId });
+        if (!user || user.balance < amount) {
+            return res.json({ success: false, error: 'Not enough balance' });
+        }
 
-  try {
-    const user = await User.findOne({ telegramId });
-    if (!user || user.balance < bet) {
-      return res.status(400).json({ error: 'Недостаточно средств на балансе' });
+        const randomRoll = Math.random() * 100;
+        const isWin = randomRoll < winChance;
+
+        let payout = 0;
+        if (isWin) {
+            payout = Math.floor(amount * multiplier);
+            user.balance += (payout - amount);
+        } else {
+            user.balance -= amount;
+        }
+
+        await user.save();
+        res.json({ success: true, win: isWin, newBalance: user.balance, payout });
+    } catch (err) {
+        res.status(500).json({ success: false, error: err.message });
     }
+});
 
-    const chances = { 1.5: 55, 2: 42, 3: 26, 5: 15, 10: 7 };
-    const winChance = chances[multiplier] || 42;
-    const isWin = Math.random() * 100 < winChance;
+app.post('/api/create-invoice', async (req, res) => {
+    try {
+        const { telegramId, amount } = req.body;
 
-    user.stats.totalGames += 1;
-    let prize = 0;
+        const response = await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/createInvoiceLink`, {
+            title: 'NexusUp Balance Top Up',
+            description: `Add ${amount} Telegram Stars`,
+            payload: `deposit_${telegramId}_${Date.now()}`,
+            currency: 'XTR',
+            prices: [{ label: 'Stars', amount: parseInt(amount) }]
+        });
 
-    if (isWin) {
-      prize = Math.round(bet * multiplier);
-      user.balance += (prize - bet);
-      user.stats.wins += 1;
-      user.stats.totalWon += (prize - bet);
-    } else {
-      user.balance -= bet;
-      user.stats.totalLost += bet;
+        if (response.data && response.data.result) {
+            res.json({ success: true, data: { invoice_url: response.data.result } });
+        } else {
+            res.json({ success: false, error: 'Failed to create invoice' });
+        }
+    } catch (err) {
+        res.status(500).json({ success: false, error: err.response?.data || err.message });
     }
-
-    const gameRecord = {
-      id: Date.now(),
-      win: isWin,
-      mult: multiplier,
-      amount: isWin ? prize : bet
-    };
-
-    user.history.unshift(gameRecord);
-    if (user.history.length > 10) user.history.pop();
-
-    await user.save();
-
-    res.json({
-      success: true,
-      isWin,
-      newBalance: user.balance,
-      prize: isWin ? prize : bet,
-      stats: user.stats,
-      historyItem: gameRecord
-    });
-
-  } catch (e) {
-    res.status(500).json({ error: 'Ошибка при обработке ставки' });
-  }
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`🚀 Сервер успешно запущен на порту ${PORT}`);
+app.post('/api/withdraw', async (req, res) => {
+    try {
+        const { telegramId, amount } = req.body;
+        if (amount < 1) return res.json({ success: false, error: 'Invalid amount' });
+
+        let user = await User.findOne({ telegramId });
+        if (!user || user.balance < amount) {
+            return res.json({ success: false, error: 'Insufficient funds' });
+        }
+
+        user.balance -= amount;
+        await user.save();
+
+        await Withdrawal.create({ telegramId, amount, status: 'pending' });
+
+        await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+            chat_id: ADMIN_ID,
+            text: `New withdrawal request:\nUser: ${telegramId}\nAmount: ${amount} stars.`,
+            parse_mode: 'Markdown'
+        }).catch(() => {});
+
+        res.json({ success: true, newBalance: user.balance });
+    } catch (err) {
+        res.status(500).json({ success: false, error: err.message });
+    }
 });
+
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
